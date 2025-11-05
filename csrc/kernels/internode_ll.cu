@@ -1,9 +1,57 @@
 #include "configs.cuh"
 #include "exception.cuh"
-#include "ibgda_device.cuh"
+//#include "ibgda_device.cuh"
+#include "transport_ops.cuh"
 #include "launch.cuh"
+#include "utils.cuh"
 
 namespace deep_ep {
+
+__device__ static __forceinline__ uint64_t HtoBE64(uint64_t x) {
+    uint64_t ret;
+    asm("{\n\t"
+        ".reg .b32 ign;\n\t"
+        ".reg .b32 lo;\n\t"
+        ".reg .b32 hi;\n\t"
+        ".reg .b32 new_lo;\n\t"
+        ".reg .b32 new_hi;\n\t"
+        "mov.b64 {lo,hi}, %1;\n\t"
+        "prmt.b32 new_hi, lo, ign, 0x0123;\n\t"
+        "prmt.b32 new_lo, hi, ign, 0x0123;\n\t"
+        "mov.b64 %0, {new_lo,new_hi};\n\t"
+        "}"
+        : "=l"(ret)
+        : "l"(x));
+    return ret;
+}
+
+__device__ static __forceinline__ uint32_t HtoBE32(uint32_t x) {
+    uint32_t ret;
+    asm("{\n\t"
+        ".reg .b32 ign;\n\t"
+        "prmt.b32 %0, %1, ign, 0x0123;\n\t"
+        "}"
+        : "=r"(ret)
+        : "r"(x));
+    return ret;
+}
+
+__device__ static __forceinline__ uint16_t HtoBE16(uint16_t x) {
+    // TODO: simplify PTX using 16-bit instructions
+    auto a = static_cast<uint32_t>(x);
+    uint32_t d;
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 mask;\n\t"
+        ".reg .b32 ign;\n\t"
+        "mov.b32 mask, 0x4401;\n\t"
+        "mov.b32 ign, 0x0;\n\t"
+        "prmt.b32 %0, %1, ign, mask;\n\t"
+        "}"
+        : "=r"(d)
+        : "r"(a));
+    return static_cast<uint16_t>(d);
+}
 
 namespace internode_ll {
 
@@ -22,6 +70,52 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
 template <int kNumThreads>
 __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr) {
     EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
+
+#if DEEP_EP_TRANSPORT_nvshmem
+    // --- NVSHMEM path ---
+
+    // 1) Drain any outstanding puts/atomics issued earlier by this PE.
+    if (thread_id == 0) nvshmem_quiet();
+    __syncthreads();
+
+    // 2) Update local counter (arrive).
+    if (thread_id == 0) atomicAdd(sync_buffer_ptr + rank, -1);
+    __syncthreads();
+
+    const int cnt = sync_buffer_ptr[rank];
+
+    // 3) Push our counter value to every other PE’s slot for us,
+    //    then wait until each peer pushes *its* counter to our slot.
+    if (thread_id < num_ranks && thread_id != rank) {
+        const int dst_rank = thread_id;
+
+        if (!is_rank_masked(mask_buffer_ptr, dst_rank)) {
+            // Each PE owns a row; peers write into that row at column "rank".
+            // This mirrors the original design: dst writes our cnt into its [rank].
+            nvshmem_int_p(/*dst=*/sync_buffer_ptr + rank, /*val=*/cnt, /*pe=*/dst_rank);
+
+            // Ensure our put is on the wire before we start checking the matching recv.
+            nvshmem_fence();
+
+            // Spin until *we* see the peer wrote its own cnt into our [dst_rank].
+            auto start_time = clock64();
+            uint64_t wait_recv_cost = 0;
+            while ((ld_acquire_sys_global(sync_buffer_ptr + dst_rank) != cnt) &&
+                   ((wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES)) {
+                // busy-wait
+            }
+
+            // Mask the peer if it times out.
+            if (wait_recv_cost > NUM_TIMEOUT_CYCLES) {
+                printf("Warning: DeepEP timeout for barrier, rank %d, dst_rank %d\n", rank, dst_rank);
+                if (mask_buffer_ptr == nullptr) trap();
+                atomicExch(mask_buffer_ptr + dst_rank, 1);
+            }
+        }
+    }
+    __syncthreads();
+
+#else
 
     // Quiet all QPs
     auto qps_per_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
@@ -42,7 +136,8 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
     if (thread_id < num_ranks && thread_id != rank) {
         const auto dst_rank = thread_id;
         const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
-        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        //const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        const auto dst_p2p_ptr = transport::peer_ptr(dst_ptr, rank, dst_rank);
 
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
@@ -67,6 +162,8 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
         }
     }
     __syncthreads();
+
+#endif
 }
 
 template <int kNumThreads>
@@ -261,10 +358,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                //const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = transport::peer_ptr(dst_ptr, rank, dst_rank);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
-                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
+                        //nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
+                        transport::put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                     } else {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
@@ -281,8 +380,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     } else if (warp_id == num_warps - 1) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
+#if DEEP_EP_TRANSPORT_ibgda
             // The first SM is also responsible for checking QPs
             EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
+#endif
 
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
@@ -331,10 +432,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
-        auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        //auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        auto dst_p2p_ptr = transport::peer_ptr(dst_ptr, rank, dst_rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
-                nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+                //nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+                transport::amo_add_nbi(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
             } else {
                 st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
             }
@@ -844,7 +947,8 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                //const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = transport::peer_ptr(dst_ptr, rank, dst_rank);
                 int num_send_bytes = hidden * sizeof(nv_bfloat16);
 
                 if (not zero_copy or dst_p2p_ptr != 0) {
@@ -909,7 +1013,8 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 // Issue RDMA
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
                 if (dst_p2p_ptr == 0)
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                    //nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                transport::put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
             }
         }
 
@@ -920,10 +1025,12 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
-            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            //auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            auto dst_p2p_ptr = transport::peer_ptr(dst_ptr, rank, dst_rank);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                    //nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                    transport::amo_add_nbi(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
                 } else {
                     st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
                 }

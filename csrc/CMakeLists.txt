@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.10)
 project(deep_ep LANGUAGES CUDA CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
+set(DEEP_EP_TRANSPORT "nvshmem" CACHE STRING "Transport backend: nvshmem | ibgda")
+set_property(CACHE DEEP_EP_TRANSPORT PROPERTY STRINGS nvshmem ibgda)
+
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fPIC")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC")
 set(CUDA_SEPARABLE_COMPILATION ON)
@@ -26,11 +29,16 @@ add_library(nvshmem_device ALIAS nvshmem::nvshmem_device)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS} ${NVSHMEM_INCLUDE_DIR})
-link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSHMEM_LIB_DIR})
+include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
+#include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS} ${NVSHMEM_INCLUDE_DIR})
+#link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSHMEM_LIB_DIR})
+
+add_compile_definitions(DEEP_EP_TRANSPORT_${DEEP_EP_TRANSPORT}=1)
+message(STATUS "DeepEP transport: ${DEEP_EP_TRANSPORT}")
 
 add_subdirectory(kernels)
 
 # Link CPP and CUDA together
 pybind11_add_module(deep_ep_cpp deep_ep.cpp)
-target_link_libraries(deep_ep_cpp PRIVATE ${EP_CUDA_LIBRARIES} ${TORCH_LIBRARIES} torch_python)
+#target_link_libraries(deep_ep_cpp PRIVATE ${EP_CUDA_LIBRARIES} ${TORCH_LIBRARIES} torch_python)
+target_link_libraries(deep_ep_cpp PUBLIC ${EP_CUDA_LIBRARIES} ${TORCH_LIBRARIES})

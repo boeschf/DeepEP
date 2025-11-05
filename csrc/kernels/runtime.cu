@@ -7,7 +7,7 @@
 #include "utils.cuh"
 
 #ifndef DISABLE_NVSHMEM
-#include "ibgda_device.cuh"
+#include "transport_ops.cuh"
 #include "nvshmem.h"
 #endif
 

@@ -48,6 +48,8 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
+        cxx_flags.append('-DDEEP_EP_TRANSPORT_nvshmem')
+        nvcc_flags.append('-DDEEP_EP_TRANSPORT_nvshmem')
         sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])

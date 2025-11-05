@@ -8,7 +8,14 @@ function(add_deep_ep_library target_name source_file)
             CUDA_STANDARD 17
             CUDA_SEPARABLE_COMPILATION ON
     )
-    target_link_libraries(${target_name} PUBLIC nvshmem cudart cudadevrt mlx5)
+    target_link_libraries(${target_name} PUBLIC
+        cudart
+        cudadevrt
+        nvshmem
+        nvshmem_host
+        nvshmem_device
+        $<$<BOOL:${DEEP_EP_TRANSPORT_IBGDA}>:mlx5>
+    )
 endfunction()
 
 add_deep_ep_library(runtime_cuda runtime.cu)
