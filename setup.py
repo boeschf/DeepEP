@@ -41,7 +41,7 @@ if __name__ == '__main__':
     include_dirs = ['csrc/']
     library_dirs = []
     nvcc_dlink = []
-    extra_link_args = []
+    extra_link_args = ['-lcuda']
 
     if CUDA_HOME is not None:
         cccl_inc = os.path.join(CUDA_HOME, 'include', 'cccl')
