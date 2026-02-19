@@ -4,7 +4,7 @@ import setuptools
 import importlib
 
 from pathlib import Path
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
@@ -42,6 +42,11 @@ if __name__ == '__main__':
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = []
+
+    if CUDA_HOME is not None:
+        cccl_inc = os.path.join(CUDA_HOME, 'include', 'cccl')
+        if os.path.isdir(cccl_inc):
+            include_dirs.append(cccl_inc)
 
     # NVSHMEM flags
     if disable_nvshmem:

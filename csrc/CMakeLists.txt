@@ -29,9 +29,7 @@ add_library(nvshmem_device ALIAS nvshmem::nvshmem_device)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
-#include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS} ${NVSHMEM_INCLUDE_DIR})
-#link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSHMEM_LIB_DIR})
+include_directories(${CUDA_TOOLKIT_INCLUDE_DIRS} ${CUDA_TOOLKIT_INCLUDE_DIRS}/cccl ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
 
 add_compile_definitions(DEEP_EP_TRANSPORT_${DEEP_EP_TRANSPORT}=1)
 message(STATUS "DeepEP transport: ${DEEP_EP_TRANSPORT}")
